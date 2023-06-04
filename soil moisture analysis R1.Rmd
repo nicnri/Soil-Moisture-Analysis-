@@ -1,0 +1,435 @@
+---
+Title: "Soil Moisture Analysis"
+Name: "Nicodemus Nyamari"
+Date: "07-03-2023"
+editor_options: 
+  chunk_output_type: console
+---
+## Introduction
+In this script, we load the data computes for the bulk density and   associated parameters such as soil moisture on volume basis and percentage of mositure on volumentric basis, hydraulic conductivity and soil moisture content from Time Domain Reflectometer reading.
+
+ Bulk Density parameters are; (i) Bulk density, Pb = Dry weight/Volume
+ 
+(ii)  Moisture percentage on volume basis, Ow= (WS1-WS2)x 100/WS2 
+ where    WS1 is the soil sample weight before oven drying in the script referred as Raw.
+          WS2 is the soil sample weight after oven drying at 105°C for 48 hours
+ (iii) Percentage of moisture by volumentric basis, Ov % = Pb X Ow/Pw
+  where Pw is the bulk density of water in g/cm3 in this case, 1g/cm3
+  
+ Hydraulic Conductivity parameters are; 
+ 
+ (i) Saturated hydraulic conductivity 
+ (ii) Matrix flux potential
+
+## Load the necessary resources
+
+Load tidyverse package
+Set the working folder
+Load the dataset using the path directory and read the csv files
+
+``` {r}
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+library(gridExtra)
+library(cowplot)
+
+library(grid)
+
+setwd('D:/CRC_PhD_Cologne/Project A05/DATA/soil moisture analysis')
+
+path_wd <-('D:/CRC_PhD_Cologne/Project A05/DATA/soil moisture analysis/Data')
+
+dat<- list.files(path=path_wd, pattern = "csv$", full.names = TRUE)
+
+bulkDensity<-read.csv(dat[1]) # read and extract the csv file
+guelph<-read.csv(dat[2])
+coord<-read.csv(dat[3])
+tdr<-read.csv(dat[4])
+
+```
+
+Create 3 matrices of Bulk density based on drying i.e. raw weight, drying after 48 hours and drying on an additional 12 hours (60 hours)
+
+```{r}
+#Extract and arrange the reading for Raw weight and dried weights
+bDRaw<-bulkDensity [bulkDensity$Drying == 'Raw', ]
+bdRaw<-bDRaw %>% arrange(pointid, Depth, Repetition)
+bdRaw[bdRaw==0]<-NA
+
+bD48hrs<-bulkDensity [bulkDensity$Drying == '48hrs', ]
+bd48<-bD48hrs%>% arrange(pointid, Depth, Repetition)
+bd48[bd48==0]<-NA
+
+bD60hrs<-bulkDensity [bulkDensity$Drying == '60hrs', ]
+bd60<-bD60hrs %>% arrange(pointid, Depth, Repetition)
+bd60[bd60==0]<-NA
+
+tdr_arr<- tdr %>% arrange(pointid, Depth, Repetition)
+tdr_arr[tdr_arr==0]<-NA
+
+# Compute the difference between drying after 48 hours and 60 hours for every depth
+
+diff60_48 <- bd60[5]-bd48[5]
+```
+
+Compute the Bulk density, moisture percentage on volume basis, and percentage of moisture by volumentric basis
+
+```{r}
+Volume<-100
+Pb<- bd48 %>% mutate(Pb=Reading/Volume) # bulk density
+Ow <- ((bdRaw[5]-bd48[5])*100)/bd48[5] # moisture percentage on volume basis
+Pw<- 1
+Ov <- (Pb[6]*Ow)/Pw # Percentage of moisture by volumetric basis
+
+bd_Ov <- cbind(bdRaw, Ov)
+colnames(bd_Ov)[6] ="BD_Ov"
+bd_Ov <- select (bd_Ov, -c('Drying', 'Reading' ))
+Ov_bdTDR <- cbind (bd_Ov, tdr_arr[4], Pb[6])
+Ov_bdTDR <- Ov_bdTDR %>% rename('TDR'= 'Reading')
+
+# combined table of  Bulk density and the TDR measurement 
+
+BD_TDR <- select (Ov_bdTDR, -c("BD_Ov"))
+
+```
+
+Computation of the Saturated Hydraulic Conductivity, Kfs and Matrix Flux Potential, Phi_m
+
+```{r}
+H<- 5 # overflow heights, H1 and H2 (cm)
+r<- 3.175 # Radius of the bore hole in cm
+Ot<- 35.17 # cross-section outer tube area in cm2
+C<- 0.85 # dimensionless shape factor outer cross-section computation
+
+alpha<- 0.12
+A <- ((2*pi*H^2)+(pi*C*r^2)+(2*pi*H/alpha))
+B <- ((((2*pi*H^2)+(pi*C*r^2))*alpha)+(2*pi*H))
+
+# Compute Q; Steady flow rate
+
+conductivity <- function(Rawdata){
+      Rawdata %>% group_by(pointid, Repetition) %>%
+            mutate(TimeInterval = (time - lag(time))/60) %>%
+            mutate(waterLevelDiff = Reading - lag(Reading)) %>%
+            mutate(waterVol=(waterLevelDiff*Ot)) %>%
+            mutate(absopRate= waterVol/TimeInterval) %>%
+            # check where the flow of water is steady
+            mutate(grp= with(rle(round(absopRate-lag(absopRate), 0)), rep(seq_along(lengths), lengths))) %>%
+            group_by(pointid, Repetition, grp) %>%
+            mutate(Counter = seq_along(grp)) %>%
+            select(-grp) %>%
+            group_by(pointid, Repetition) %>%
+            mutate(Q = case_when(Counter==max(Counter)~ absopRate,
+                       Counter==1 ~ mean(tail(na.omit(absopRate), 3)), # if the is no steady flow of water get the mean of the last three readings
+                       TRUE ~ 0)) %>% #, .keep='used')
+            filter(Q > 0) %>%
+            filter (Counter==max(Counter)) %>%
+            filter(time == max(time)) %>%
+            select(pointid, Repetition, Q)%>%
+            # compute for the saturated hydraulic conductivity and matrix of flux potential
+            mutate (Kfs= C*Q/A )%>%
+            mutate(phi_m= C*Q/B)
+  }
+Hydraulic_Conductivity <- conductivity (guelph)
+
+# extracting the saturated hydraulic conductivity
+
+Hydraulic_Conductivity <- select(round(Hydraulic_Conductivity, 4), -c('Q', 'phi_m'))
+
+```
+
+Add Spatial component (coordinates) to the bulk density, moisture and conductivity attributes 
+
+```{r}
+coord <- coord %>% select(pointid,label,Dist2Road, landSlopeDirection, 
+                          Category, Longitude, Latitude)
+
+conductivity_SP <- Hydraulic_Conductivity %>% left_join(coord)
+
+soilMoisture_SP <- BD_TDR %>% left_join(coord)
+```
+
+Generate a heat-map for the points against the depth to show the distribution of different parameters i.e. saturated hydraulic conductivity, bulk density, percentage of soil moisture content
+
+```{r}
+TR1_moisture <- soilMoisture_SP %>% filter(str_detect(label,"Tr1"))
+TR2_moisture <- soilMoisture_SP %>% filter(str_detect(label,"Tr2"))
+TR3_moisture<- soilMoisture_SP %>% filter(str_detect(label,'Tr3'))
+luMoist<- soilMoisture_SP %>% filter(str_detect(label,'Mstn'))
+
+tr1_cond <- conductivity_SP %>% filter (str_detect(label,'Tr1'))
+tr2_cond <- conductivity_SP %>% filter (str_detect(label,'Tr2'))
+tr3_cond <- conductivity_SP %>% filter (str_detect(label,'Tr3'))
+lucond<- conductivity_SP %>% filter(str_detect(label,'Mstn'))
+
+
+#tr1_cond1 <- conductivity_SP %>% filter (str_detect(label,'Tr3')& Repetition==3 )
+
+#tr<- ggplot(data= tr1_cond1, aes(x=label, y= Kfs, group=1))+ geom_line(color="red")+ geom_point()
+
+```
+
+Plot the chart for TDR measurement of soil moisture content using patchwork and ggarrange packages
+
+```{r}
+
+plt_cTDR <- ggplot(data= na.omit(luMoist), aes(x=TDR, y= Depth, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 0.5)+
+    geom_path() +scale_y_continuous(trans = "reverse") + scale_x_continuous(limits = c(0,40)) + labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none") + #ggtitle('Transect 1')+
+facet_grid(~factor(label, levels=c('FMstn1','GrMstn2', 'AgricMstn3'),  labels=c('Forest','Grassland', 'Agricultural'))) 
+
+plt_cTDR
+
+plt_tdr1 <- ggplot(data= na.omit(TR1_moisture), aes(x=TDR, y= Depth, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 0.5)+
+    geom_path() +scale_y_continuous(trans = "reverse") + scale_x_continuous(limits = c(0,40)) + labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none") + #ggtitle('Transect 1')+
+facet_grid(~factor(label, levels=c('Tr1u0Rd','Tr1d0Rd', 'Tr1d250', 'Tr1d500'),  labels=c('+SRd','-SRd', '-250m', '-500m'))) 
+
+
+plt_tdr2<- ggplot(data= na.omit(TR2_moisture), aes(x=TDR, y= Depth, group= Repetition, color=as.factor (Repetition))) +
+    geom_path() + geom_point(size = 0.5)+#ggtitle('Transect 2') +
+  scale_y_continuous(trans = "reverse") +  labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+
+   facet_grid(~factor(label,levels=c('Tr2u500','Tr2u250','Tr2u0Rd','Tr2d0Rd', 'Tr2d250', 'Tr2d500'), labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m'))) + theme(axis.title = element_blank(), text = element_text(size=8))
+
+
+plt_tdr3 <- ggplot(data= na.omit(TR3_moisture), aes(x=TDR, y= Depth, group= Repetition, color=as.factor (Repetition))) +
+    geom_path() + geom_point(size = 0.5)+ #ggtitle('Transect 3') +
+  scale_y_continuous(trans = "reverse") +  labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+
+   facet_grid(~factor(label,levels=c('Tr3u500','Tr3u250','Tr3u0Rd','Tr3d0Rd', 'Tr3d250', 'Tr3d500'), labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m'))) + theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none")
+
+
+#p2_dims <- get_dim(plt_tdr2)
+
+#p1_aligned <- set_dim(p1, p2_dims)
+ 
+plt_tdr <- plt_tdr1/plt_tdr2/plt_tdr3/plt_cTDR + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'a') + labs(caption = "SRd means starting point on road after drainage ~ 21m from centreline")+ theme(plot.caption.position = "plot", text = element_text(size=9))
+
+plt_tdr<- grid.arrange(patchworkGrob(plt_tdr), left = textGrob("Depth (cm)",rot = 90, gp = gpar(fontsize = 11)), bottom= textGrob('TDR soil moisture content (%)', gp = gpar(fontsize = 11)))
+
+
+ggsave(filename= 'TDR soil moisture content.jpeg', plot = plt_tdr, width = 160, height = 120, units = c("mm"),dpi = 1000)
+ggsave(filename= 'TDR soil moisture content.pdf', plot = plt_tdr, width = 160, height = 120, units = c("mm"),dpi = 1000)
+
+
+```
+
+Plot the chart for Bulk density
+
+```{r}
+
+plt_cbd <- ggplot(data= na.omit(luMoist), aes(x=Pb, y= Depth, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 0.5)+
+    geom_path() +scale_y_continuous(trans = "reverse") + scale_x_continuous(limits = c(0,1.5)) + labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none") + #ggtitle('Transect 1')+
+facet_grid(~factor(label, levels=c('FMstn1','GrMstn2', 'AgricMstn3'),  labels=c('Forest','Grassland', 'Agricultural')))
+
+plt_bd1 <- ggplot(data= na.omit(TR1_moisture), aes(x=Pb, y= Depth, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 0.5)+
+    geom_path(na.rm = FALSE) +scale_y_continuous(trans = "reverse") + scale_x_continuous(limits = c(0,1.5)) + labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+#ggtitle('Transect 1')+
+facet_grid(~factor(label, levels=c('Tr1u0Rd','Tr1d0Rd', 'Tr1d250', 'Tr1d500'),  labels=c('+SRd','-SRd', '-250m', '-500m'))) + theme(axis.title = element_blank(), text = element_text(size=7), legend.position = "none")
+
+plt_bd2 <- ggplot(data= na.omit(TR2_moisture), aes(x=Pb, y= Depth, group= Repetition, color=as.factor (Repetition))) +
+    geom_path(na.rm = FALSE) + geom_point(size = 0.5)+ scale_x_continuous(limits = c(0,1.6))+#ggtitle('Transect 2') +
+  scale_y_continuous(trans = "reverse") +  labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+
+   facet_grid(~factor(label,levels=c('Tr2u500','Tr2u250','Tr2u0Rd','Tr2d0Rd', 'Tr2d250', 'Tr2d500'), labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m'))) + theme(axis.title = element_blank(), text = element_text(size=8))
+
+plt_bd3 <- ggplot(data= na.omit(TR3_moisture), aes(x=Pb, y= Depth, group= Repetition, color=as.factor (Repetition))) +
+    geom_path(na.rm = FALSE) + geom_point(size = 0.5)+ #ggtitle('Transect 3') +
+  scale_y_continuous(trans = "reverse") +  labs(color='Replicate') + scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+
+   facet_grid(~factor(label,levels=c('Tr3u500','Tr3u250','Tr3u0Rd','Tr3d0Rd', 'Tr3d250', 'Tr3d500'), labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m'))) + theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none")
+
+plt_bd<- plt_bd1/plt_bd2/plt_bd3/plt_cbd + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'a') + labs(caption = "SRd means starting point on road after drainage ~ 21m from centreline")+ theme(plot.caption.position = "plot", text = element_text(size=9))
+
+plt_bd<- grid.arrange(patchworkGrob(plt_bd), left = textGrob("Depth (cm)",rot = 90, gp = gpar(fontsize = 11)), bottom= textGrob('Bulk Density (g/cm3)', gp = gpar(fontsize = 11)))
+
+
+ggsave(filename= 'Bulk Density.jpeg', plot = plt_bd, width = 160, height = 120, units = c("mm"),dpi = 1000)
+ggsave(filename= 'Bulk Density.pdf', plot = plt_bd, width = 160, height = 120, units = c("mm"),dpi = 1000)
+
+```
+
+Ploting the charts for Staturated Hydraulic conductivity
+
+```{r}
+plt_condLU <- ggplot(data= na.omit(lucond), aes(x=factor(label, level= c('FMstn1','GrMstn2', 'AgricMstn3')), y= Kfs, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 1)+ labs(color='Replicate', y= 'Kfs')+ scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ scale_x_discrete(labels=c('Forest','Grassland', 'Agricultural')) + theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none")
+ 
+
+plt_condTr1 <- ggplot(data= na.omit(tr1_cond), aes(x=factor(label, level= c('Tr1u500','Tr1u250','Tr1u0Rd','Tr1d0Rd', 'Tr1d250', 'Tr1d500')), y= Kfs, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 1)+ labs(color='Replicate', y= 'Kfs')+ scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ scale_x_discrete(labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m')) + theme(axis.title = element_blank(), text = element_text(size=8), legend.position = "none")#+ ggtitle('Transect 1')
+
+
+plt_condTr2 <- ggplot(data= na.omit(tr2_cond), aes(x=factor(label, level= c('Tr2u500','Tr2u250','Tr2u0Rd','Tr2d0Rd', 'Tr2d250', 'Tr2d500')), y= Kfs, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 1)+ scale_y_continuous(limits = c(0,0.2))+ scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ labs(color='Replicate', x= 'Transect Points')+ scale_x_discrete(labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m')) + theme(axis.title = element_blank(), text = element_text(size=8))
+
+
+plt_condTr3 <- ggplot(data= na.omit(tr3_cond), aes(x=factor(label, level= c('Tr3u500','Tr3u250','Tr3u0Rd','Tr3d0Rd', 'Tr3d250', 'Tr3d500')), y= Kfs, group= Repetition, color=as.factor (Repetition))) + geom_point(size = 1)+ scale_y_continuous(limits = c(0,0.2))+ scale_colour_manual(values = c("#2C5D37", "#EE51B1", "#4B2D9F"))+ labs(color='Replicate', x= 'Transect Points')+ scale_x_discrete(labels=c('500m','250m','+SRd','-SRd', '-250m', '-500m')) + theme(axis.title = element_blank(), text = element_text(size=8))
+
+plt_cond<- (plt_condTr1 / plt_condTr2 / plt_condTr3 / plt_condLU) + plot_layout((nrow=2), guides = "collect")+ plot_annotation(tag_levels = 'a') + labs(caption = "SRd means starting point on road after drainage ~ 21m from centreline")
+
+plt_cond <- grid.arrange(patchworkGrob(plt_cond), left = textGrob("Saturated hydraulic conductivity, Kfs (cm/s)",rot = 90, gp = gpar(fontsize = 9)), bottom= textGrob('Transect points by perpendicular distance from the road',  gp = gpar(fontsize = 9)))
+
+plt_cond
+
+ggsave(filename= 'Saturated Hydraulic Conductivity.jpeg', plot = plt_cond, width = 200, height = 120, units = c("mm"),dpi = 1000)
+ggsave(filename= 'Saturated Hydraulic Conductivity.pdf', plot = plt_cond, width = 200, height = 120, units = c("mm"),dpi = 1000)
+
+```
+
+Plot of the soil moisture at the meteor station for time-series data
+
+```{r}
+
+path_wdTimeSeries <-('D:/CRC_PhD_Cologne/Project A05/DATA/soil moisture analysis/soil moisture time series')
+
+
+dat1<- list.files(path=path_wdTimeSeries, pattern = "csv$", full.names = TRUE)
+kefri<- read.csv(dat1[3])
+lugumgum<- read.csv(dat1[4])
+salabani<- read.csv(dat1[4])
+
+# plot of time series soil moisture for kefri sensors
+
+kefriHourly <- kefri %>% mutate(Time = dmy_hm(Time),Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+LugmHourly <- lugumgum %>% mutate(Time = dmy_hm(Time), Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+
+salabaniHourly<- salabani %>% mutate(Time = dmy_hm(Time), Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+medKefri <- kefriHourly %>% summarise(Moisture = median(Value, na.rm = TRUE)) %>% ungroup()
+medLugum <- LugmHourly %>% summarise(Moisture = median(Value, na.rm = TRUE)) %>% ungroup()
+medSal <- salabaniHourly %>% summarise(Moisture = median(Value, na.rm = TRUE)) %>% ungroup()
+
+
+plt_kefri<- ggplot(data= medKefri, aes(x=Time2, y= Moisture, group= Depth, color=Depth)) +
+    geom_line() + labs(color='Depth') + scale_colour_manual(values = c("#C34A36", "#00C8F4", "#954FD5"))  + labs(color='Sensor Depth (cm)', x= 'Date (2022/2023)', y= 'Moisture content ( m3/m3)') + theme(axis.title = element_blank(), text = element_text(size=8))
+
+#plt_kefri
+
+plt_lugumugum<- ggplot(data= medLugum , aes(x=Time2, y= Moisture, group= Depth, color=Depth)) + geom_line() + labs(color='Depth') + scale_colour_manual(values =  c("#C34A36", "#00C8F4", "#954FD5"))  + labs(color='Sensor Depth (cm)', x= 'Date (2022/2023)', y= 'Moisture content ( m3/m3)') + theme(axis.title = element_blank(), text = element_text(size=8))
+
+#plt_lugumugum
+
+plt_salabani<- ggplot(data= medSal, aes(x=Time2, y=Moisture, group= Depth, color=Depth)) + geom_line() + labs(color='Depth') + scale_colour_manual(values =  c("#C34A36", "#00C8F4", "#954FD5")) + labs(color='Sensor Depth (cm)', x= 'Date (2022/2023)', y= 'Moisture content ( m3/m3)') + theme(axis.title = element_blank(), text = element_text(size=8))
+
+#plt_salabani
+
+
+plt_H2O<- (plt_kefri/plt_lugumugum/ plt_salabani) + plot_layout(guides = "collect")+ plot_annotation(tag_levels = 'A') 
+
+plt_H2O <- grid.arrange(patchworkGrob(plt_H2O), left = textGrob("Moisture content ( m3/m3)",rot = 90, gp = gpar(fontsize = 9)), bottom= textGrob('Date (December 2022/2023)',  gp = gpar(fontsize = 9)))
+
+plt_H2O
+
+ggsave(filename= 'Soil Sensors moisture measurements at Meteor stations_Timeseries.jpeg', plot = plt_H2O, width = 200, height = 120, units = c("mm"),dpi = 1000)
+ggsave(filename= 'Soil Sensors moisture measurements at Meteor stations_Timeseries.pdf', plot = plt_H2O, width = 200, height = 120, units = c("mm"),dpi = 1000)
+
+```
+
+Plot the precipitation with soil water content time series
+```{r}
+path_wdTimeSeriesAll <- 'D:/CRC_PhD_Cologne/Project A05/DATA/soil moisture analysis/soil moisture time series/all Data'
+
+dat2<- list.files(path=path_wdTimeSeriesAll, pattern = "csv$", full.names = TRUE)
+
+kefriMeteor<- read.csv(dat2[1])
+kefriSoil<- read.csv(dat2[2])
+
+lugumMeteorSoil<- read.csv(dat2[3])
+salMeteorSoil<- read.csv(dat2[4])
+
+KefriCombined <- kefriMeteor %>% left_join(kefriSoil)
+
+LugumMSHourly <- lugumMeteorSoil %>% mutate(Time = dmy_hm(Time),Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+SalMSHourly <- salMeteorSoil %>% mutate(Time = dmy_hm(Time),Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+kefriCombHourly <- KefriCombined %>% mutate(Time = dmy_hm(Time),Time2 = floor_date(Time, unit = "hour")) %>% gather(Depth, Value, ends_with("cm")) %>% group_by(Time2, Depth)
+
+
+
+medKefriComb <- kefriCombHourly%>% summarise(Moisture = median(Value, na.rm = TRUE)) %>% ungroup()
+
+
+plt_KefriSolar<- ggplot(data= na.omit (kefriCombHourly)) + geom_bar(aes(x=Time, y=Precipitation, group = 1,fill=),stat="identity", fill="cyan",colour="#006000") +  geom_line(aes(x=Time, y= Value, group= Depth, color=Depth), size=0.5)+ labs(color='Depth') + scale_colour_manual(values = c("#C34A36", "#00C8F4", "#954FD5"))  + labs(color='Sensor Depth (cm)', x= 'Date (2023)', y= 'Moisture content ( m3/m3)')+  theme(axis.title = element_blank(),text = element_text(size=8), legend.position = "none")+ scale_y_continuous(limits = c(0,0.4), sec.axis=sec_axis(~.*1.25, name="Precipitation (mm)"))
+
+
+plt_lugmMS<- ggplot(data= na.omit (LugumMSHourly)) + geom_bar(aes(x=Time, y=Precipitation, group = 'Precipitation'),stat="identity", fill="cyan",colour="#006000") +  geom_line(aes(x=Time, y= Value, group= Depth, color=Depth), size=0.5)+ labs(color='Depth') + labs(color='Precipitation') + scale_colour_manual(values = c("#C34A36", "#00C8F4", "#954FD5"))  + labs(color='Sensor Depth (cm)', color='Precipitation', x= 'Date (2022/2023)', y= 'Moisture content ( m3/m3)') + theme(text = element_text(size=8))+ scale_y_continuous(limits = c(0,1), sec.axis=sec_axis(~.*10, name="Precipitation (mm)"))
+plt_lugmMS
+
+plt_SalMS<- ggplot(data= na.omit (SalMSHourly)) + geom_bar(aes(x=Time, y=Precipitation, group = 'Precipitation'),stat="identity", fill="cyan",colour="#006000") +  geom_line(aes(x=Time, y= Value, group= Depth, color=Depth), size=0.5) + scale_colour_manual(values = c("#C34A36", "#00C8F4", "#954FD5")) + labs(color='Depth') + labs(color='Sensor Depth (cm)', x= 'Date (2022/2023)', y= 'Moisture content ( m3/m3)') + theme(axis.title = element_blank(),text = element_text(size=8), legend.position = "none")+ scale_y_continuous(limits = c(0,1), sec.axis=sec_axis(~.*10, name="Precipitation (mm)"))
+
+
+plt_MS<- (plt_KefriSolar/plt_lugmMS/ plt_SalMS) + plot_annotation(tag_levels = 'A') + plot_layout(guides = "collect")
+
+#plt_MS <- grid.arrange(patchworkGrob(plt_MS), left = textGrob("Moisture content ( m3/m3)",rot = 90, gp = gpar(fontsize = 9)), bottom= textGrob('Date (December 2022/2023)',  gp = gpar(fontsize = 9)))
+
+#ggsave(filename= 'Precipitation and Soil Sensors moisture measurements at Meteor stations_Timeseries.jpeg', plot = plt_MS, width = 200, height = 120, units = c("mm"),dpi = 1000)
+
+#ggsave(filename= 'Precipitation and Soil Sensors moisture measurements at Meteor stations_Timeseries.pdf', plot = plt_MS, width = 200, height = 120, units = c("mm"),dpi = 1000)
+
+```
+Plot air temperature, solar radiation and precipitation
+
+```{r}
+
+scale_factor <- max(kefriMeteor$SolarRadiation)/max(kefriMeteor$AirTemperature)
+
+plt_MSKefri <- ggplot(data = na.omit (kefriCombHourly), aes(x = Time))+ geom_line(aes(y = SolarRadiation, color=SolarRadiation, linetype = "Solar radiation", group = 1), color='#FF6F91', size=0.3) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + theme(axis.text = element_text(size = 9), axis.title = element_text(size = 14, face = "bold"))+labs( x= 'Date (2023)', y= 'Solar radiation ( W/m2)') + geom_line(aes(y = AirTemperature*scale_factor, group = 1, linetype= 'Air temperature'), color="#009EFA", size= 0.3) +  scale_y_continuous(sec.axis = sec_axis(~.* scale_factor/1000, name="Air Temperature (°c)")) + theme(legend.background = element_rect(fill = "transparent"),legend.box.background = element_rect(fill = "transparent", colour = NA), legend.key = element_rect(fill = "transparent"),legend.spacing = unit(-1, "lines")) + labs(y = 'Air temperature')
+
+plt_MSKefri
+
+#ggsave(filename= 'KeFRI SolarRadiation and Air Temoperature.jpeg', plot = plt_MSKefri, width = 200, height = 80, units = c("mm"),dpi = 1000)
+
+#ggsave(filename= 'KeFRI SolarRadiation and Air Temoperature.pdf', plot = plt_MSKefri, width = 200, height = 80, units = c("mm"),dpi = 1000)
+
+```
+
+Plot the sample and meteor station coordinates
+
+```{r}
+library(ggmap)
+library(maps) 
+library(ggthemes)
+library(XML)
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(sf)
+library(dplyr)
+library(RColorBrewer)
+library(leaflet.opacity)
+library(leaflet)
+library(leaflet.opacity)
+library(mapview)
+
+bbox=c(left=35.522, bottom=-0.2237042, right= 36.48789, top=1.666471)
+#lakeBaringo<- get_stamenmap(bbox, maptype = 'terrain', zoom = 12)
+#ggmap(lakeBaringo) + geom_point(data=coord, aes(x=Longitude , y= Latitude ), size= 0.5)+ theme_map()
+```
+
+``` {r}
+url = "https://files.isric.org/soilgrids/latest/data/"
+
+#voi = "nitrogen" # variable of interest
+#depth = "15-30cm"
+#quantile = "mean"
+
+#(variable = paste(url, voi, sep=""))
+#(layer = paste(variable,depth,quantile, sep="_")) # layer of interest 
+#(vrt_layer = paste(layer, '.vrt', sep=""))
+
+#nitro = raster("https://files.isric.org/soilgrids/latest/data/nitrogen/nitrogen_15-30cm_mean.vrt")
+
+baringo<- st_read('D:/CRC_PhD_Cologne/PhD Thesis/Study Area/Proposed Measurement Station site Shapefile/Baringo county boundary.shp')
+
+layer = 'nitrogen/nitrogen_15-30cm_mean.vrt'
+lfile ='D:/CRC_PhD_Cologne/PhD Thesis/Study Area/Proposed Measurement Station site Shapefile/Baringo county boundary.shp'
+
+lyr <- gdal_translate(paste0(url,layer), lfile ,
+               tr=c(250,250),
+               projwin=bbox,
+               projwin_srs = st_crs(baringo), 
+               verbose=TRUE)
+
+
+nitrogen <- raster(lyr)
+```
+
+
+
+
