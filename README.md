@@ -1,1 +1,1 @@
-# Soil-Moisture-Analysis-
+# Soil-Moisture-Analysis-The script computes the soil moisture parameters; bulk density, volumetric moisture percentage, saturated hydraulic conductivity and comparison wuth the SoilGrid data for Lake Baringo region in Kenya
